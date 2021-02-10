@@ -7,11 +7,52 @@ Go to the trusty [Spring Initializr](https://start.spring.io) and generate a new
 
 Add the following configuration values to `application.properties`. We'll review them as they become relevant. For now, the critical thing to keep in mind is that we're running the `service` on port `8083`, and we've given this service a name with the `spring.application.name` property, `service`.
 
-// include: basics/service/src/main/resources/application.properties 
+https://github.com/shakuzen/console-availability/tree/master/basics/service/src/main/resources/application.properties 
+```properties
+spring.application.name=service
+server.port=8083
+wavefront.application.name=console-availability
+management.metrics.export.wavefront.source=my-cloud-server
+```
 
 Here's the Java code.
 
-// include: basics/service/src/main/java/server/Application.java
+https://github.com/shakuzen/console-availability/blob/master/basics/service/src/main/java/server/ServiceApplication.java
+```java
+@Slf4j
+@SpringBootApplication
+public class ServiceApplication {
+
+    public static void main(String[] args) {
+        log.info("starting server");
+        SpringApplication.run(ServiceApplication.class, args);
+    }
+}
+
+@RestController
+class AvailabilityController {
+
+    private boolean validate(String console) {
+        return StringUtils.hasText(console) &&
+               Set.of("ps5", "ps4", "switch", "xbox").contains(console);
+    }
+
+    @GetMapping("/availability/{console}")
+    Map<String, Object> getAvailability(@PathVariable String console) {
+        return Map.of("console", console,
+                "available", checkAvailability(console));
+    }
+
+    private boolean checkAvailability(String console) {
+        Assert.state(validate(console), () -> "the console specified, " + console + ", is not valid.");
+        return switch (console) {
+            case "ps5" -> throw new RuntimeException("Service exception");
+            case "xbox" -> true;
+            default -> false;
+        };
+    }
+}
+```
 
 Given a request for a particular type of console (`ps5`, `nintendo`, `xbox`, `ps4`), the API returns the console's availability (presumably sourced from local electronics outlets). Except for some reason, which for our demo will have to be _deus ex machina_ - there is no PlayStation 5 availability. Worse, the service itself is experiencing errors and blowing chunks every time someone even dares to inquire about the Playstation 5! We'll use this particular code path - asking about the availability of Playstation 5's in particular - to simulate an error in our system. Don't judge. You've probably made an error at some point, too. Probably. 
 
@@ -21,11 +62,71 @@ We'll need a client to talk to the service and drive some traffic to it. Return 
 
 Here's the configuration file. 
 
-// include: basics/client/src/main/resources/application.properties 
+https://github.com/shakuzen/console-availability/blob/master/basics/client/src/main/resources/application.properties 
+```properties
+spring.application.name=client
+wavefront.application.name=console-availability
+management.metrics.export.wavefront.source=my-cloud-server
+```
 
 The code uses the reactive, non-blocking `WebClient` to issue requests against the service. The entire application - both `client` and `service` - use reactive, non-blocking HTTP. You could just as easily use the traditional Servlet-based Spring MVC. Or you could avoid HTTP altogether and use messaging technologies. Or you could use both. Here's the Java code. 
 
-// include: basics/client/src/main/java/client/Application.java
+https://github.com/shakuzen/console-availability/blob/master/basics/client/src/main/java/client/ClientApplication.java
+```java
+@Slf4j
+@SpringBootApplication
+public class ClientApplication {
+
+    public static void main(String[] args) {
+        log.info("starting client");
+        SpringApplication.run(ClientApplication.class, args);
+    }
+
+    @Bean
+    WebClient webClient(WebClient.Builder builder) {
+        return builder.build();
+    }
+
+    @Bean
+    ApplicationListener<ApplicationReadyEvent> ready(AvailabilityClient client) {
+        return applicationReadyEvent -> {
+            for (var console : "ps5,xbox,ps4,switch".split(",")) {
+                Flux.range(0, 20).delayElements(Duration.ofMillis(100)).subscribe(i ->
+                        client
+                                .checkAvailability(console)
+                                .subscribe(availability ->
+                                        log.info("console: {}, availability: {} ", console, availability.isAvailable())));
+            }
+        };
+    }
+}
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+class Availability {
+    private boolean available;
+    private String console;
+}
+
+@Component
+@RequiredArgsConstructor
+class AvailabilityClient {
+
+    private final WebClient webClient;
+    private static final String URI = "http://localhost:8083/availability/{console}";
+
+    Mono<Availability> checkAvailability(String console) {
+        return this.webClient
+                .get()
+                .uri(URI, console)
+                .retrieve()
+                .bodyToMono(Availability.class)
+                .onErrorReturn(new Availability(false, console));
+    }
+
+}
+```
 
 Start the `service` application, and then start the `client` application. The `client` application generates a lot of demand directed at the service, some of which results in failed requests. We want to capture all of that information. 
 
@@ -101,7 +202,58 @@ Let's take things a bit further and customize the metadata captured by Spring Cl
 
 We'll update the service to inject a `SpanCustomizer` to customize the trace information. We'll also update the service to configure a `WebFluxTagsContributor` to customize the tags captured by Spring Boot and given to Micrometer. Here's the new and updated code.
 
-// include: enhanced/service/src/main/java/server/Application.java
+https://github.com/shakuzen/console-availability/blob/master/enhanced/service/src/main/java/server/ServiceApplication.java
+```java
+@Slf4j
+@SpringBootApplication
+public class ServiceApplication {
+
+    @Bean
+    WebFluxTagsContributor consoleTagContributor() {
+        return (exchange, ex) -> {
+            var console = "UNKNOWN";
+            var consolePathVariable = ((Map<String,String>) exchange.getAttribute(HandlerMapping.URI_TEMPLATE_VARIABLES_ATTRIBUTE)).get("console");
+            if (AvailabilityController.validateConsole(consolePathVariable)) {
+                console = consolePathVariable;
+            }
+            return Tags.of("console", console);
+        };
+    }
+
+    public static void main(String[] args) {
+        log.info("starting server");
+        SpringApplication.run(ServiceApplication.class, args);
+    }
+}
+
+@RestController
+@AllArgsConstructor
+class AvailabilityController {
+
+    private final SpanCustomizer spanCustomizer;
+
+    @GetMapping("/availability/{console}")
+    Map<String, Object> getAvailability(@PathVariable String console) {
+        Assert.state(validateConsole(console), () -> "the console specified, " + console + ", is not valid.");
+        this.spanCustomizer.tag("console", console);
+        return Map.of("console", console, "available", checkAvailability(console));
+    }
+
+    private boolean checkAvailability(String console) {
+        return switch (console) {
+            case "ps5" -> throw new RuntimeException("Service exception");
+            case "xbox" -> true;
+            default -> false;
+        };
+    }
+
+    static boolean validateConsole(String console) {
+        return StringUtils.hasText(console) &&
+               Set.of("ps5", "ps4", "switch", "xbox").contains(console);
+    }
+
+}
+```
 
 Re-run the service with the above changes and then the client (same as before), and wait a minute for metrics to be published. Then open up the Wavefront console again; use that handy link printed in the console output!
 
